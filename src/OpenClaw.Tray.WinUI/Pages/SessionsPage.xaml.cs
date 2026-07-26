@@ -185,12 +185,12 @@ public sealed partial class SessionsPage : Page
             return;
         }
 
-        var activeSessions = SessionVisibilityFilter.VisibleSessions(
+        var visibleSessions = SessionVisibilityFilter.VisibleSessions(
                 SessionsForCurrentBackgroundScope(),
                 ShowCompletedSessions)
             .ToList();
-        var activeTitles = SessionTitleFormatter.FormatUnique(activeSessions);
-        IEnumerable<(SessionInfo Session, string Title)> filtered = activeSessions
+        var activeTitles = SessionTitleFormatter.FormatUnique(visibleSessions);
+        IEnumerable<(SessionInfo Session, string Title)> filtered = visibleSessions
             .Select((session, index) => (Session: session, Title: activeTitles[index]));
 
         if (_activeChannel != "all")
@@ -200,7 +200,8 @@ public sealed partial class SessionsPage : Page
         }
 
         var viewModels = filtered
-            .OrderByDescending(item => item.Session.UpdatedAt ?? item.Session.LastSeen)
+            .OrderBy(item => SessionRunState.GetDisplaySortOrder(item.Session))
+            .ThenByDescending(item => item.Session.UpdatedAt ?? item.Session.LastSeen)
             .Select(item => ToViewModel(item.Session, item.Title))
             .ToList();
 
@@ -271,12 +272,14 @@ public sealed partial class SessionsPage : Page
     private SessionViewModel ToViewModel(SessionInfo s, string displayName)
     {
         var subtitle = SessionTitleFormatter.FormatSubtitle(s);
-        var parts = new List<string>(4);
+        var parts = new List<string>(5);
         if (!string.IsNullOrWhiteSpace(subtitle)) parts.Add(subtitle!);
         if (!string.IsNullOrWhiteSpace(s.Provider)) parts.Add(s.Provider!);
         if (!string.IsNullOrWhiteSpace(s.Model)) parts.Add(s.Model!);
         if (string.IsNullOrWhiteSpace(subtitle) && !string.IsNullOrWhiteSpace(s.Channel))
             parts.Add(s.Channel!);
+        if (SessionRunState.HasStoppedLastRun(s))
+            parts.Add(LocalizationHelper.GetString("SessionsPage_LastRunStopped"));
 
         var hasTokens = s.InputTokens > 0 || s.OutputTokens > 0;
         var tokensText = hasTokens
@@ -302,7 +305,8 @@ public sealed partial class SessionsPage : Page
             AgeText = s.AgeText,
             DetailLine = parts.Count > 0 ? string.Join(" · ", parts) : "",
             StatusBrush = ResolveStatusBrush(s),
-            StatusTooltip = ResolveStatusTooltip(s),
+            StatusText = ResolveStatusText(s),
+            StatusTooltip = ResolveStatusText(s),
             TokensText = tokensText,
             ContextPercent = contextPercent,
             HasTokenData = hasTokens || contextPercent > 0,
@@ -314,23 +318,22 @@ public sealed partial class SessionsPage : Page
 
     private static Brush ResolveStatusBrush(SessionInfo s)
     {
-        var status = s.Status?.Trim().ToLowerInvariant();
-        if (status is "error" or "failed" or "failure")
-            return s_criticalBrush.Value;
-        if (s.AbortedLastRun)
-            return s_cautionBrush.Value;
-        if (status is "active" or "running")
-            return s_successBrush.Value;
-        return s_neutralBrush.Value;
+        return SessionRunState.GetDisplayState(s) switch
+        {
+            SessionDisplayState.Working => s_successBrush.Value,
+            SessionDisplayState.NeedsAttention => s_criticalBrush.Value,
+            _ => s_neutralBrush.Value,
+        };
     }
 
-    private static string ResolveStatusTooltip(SessionInfo s)
+    private static string ResolveStatusText(SessionInfo s)
     {
-        var status = s.Status?.Trim().ToLowerInvariant();
-        if (status is "error" or "failed" or "failure") return "Error";
-        if (s.AbortedLastRun) return "Aborted last run";
-        if (status is "active" or "running") return "Running";
-        return "Idle";
+        return SessionRunState.GetDisplayState(s) switch
+        {
+            SessionDisplayState.Working => LocalizationHelper.GetString("SessionsPage_Status_Working"),
+            SessionDisplayState.NeedsAttention => LocalizationHelper.GetString("SessionsPage_Status_NeedsAttention"),
+            _ => LocalizationHelper.GetString("SessionsPage_Status_Ready"),
+        };
     }
 
     private static readonly Lazy<Brush> s_successBrush =
@@ -927,7 +930,8 @@ public class SessionViewModel
     public string AgeText { get; set; } = "";
     public string DetailLine { get; set; } = "";
     public Brush StatusBrush { get; set; } = new SolidColorBrush(Colors.Gray);
-    public string StatusTooltip { get; set; } = "Idle";
+    public string StatusText { get; set; } = "Ready";
+    public string StatusTooltip { get; set; } = "Ready";
     public string TokensText { get; set; } = "";
     public double ContextPercent { get; set; }
     public bool HasTokenData { get; set; }

@@ -486,6 +486,14 @@ public sealed class WindowsSidecarCapabilityAdapterTests
         if (!OperatingSystem.IsWindows() || string.IsNullOrWhiteSpace(probePath))
             return;
 
+        var configuredReparseProbe = Environment.GetEnvironmentVariable(
+            "OPENCLAW_RUST_SIDECAR_REPARSE_PROBE");
+        if (!string.IsNullOrWhiteSpace(configuredReparseProbe))
+        {
+            await AssertReparseProbeIsRejectedAsync(configuredReparseProbe, probePath);
+            return;
+        }
+
         var temporaryDirectory = Directory.CreateTempSubdirectory("openclaw-sidecar-path-");
         var linkedDirectory = Path.Combine(temporaryDirectory.FullName, "probe-link");
         try
@@ -500,25 +508,34 @@ public sealed class WindowsSidecarCapabilityAdapterTests
                 return;
             }
 
-            var linkedProbe = Path.Combine(linkedDirectory, Path.GetFileName(probePath));
-            var expectedHash = await ComputeSha256Async(probePath, CancellationToken.None);
-            var launcher = new WindowsSidecarProcessLauncher();
-
-            var error = await Assert.ThrowsAsync<SidecarProtocolException>(() => launcher.LaunchAsync(
-                linkedProbe,
-                expectedHash,
-                "reparse-point-session",
-                1,
-                new byte[32],
-                4096,
-                CancellationToken.None));
-
-            Assert.Contains("reparse point", error.Message, StringComparison.Ordinal);
+            await AssertReparseProbeIsRejectedAsync(
+                Path.Combine(linkedDirectory, Path.GetFileName(probePath)),
+                probePath);
         }
         finally
         {
             temporaryDirectory.Delete(recursive: true);
         }
+    }
+
+    private static async Task AssertReparseProbeIsRejectedAsync(
+        string reparseProbePath,
+        string expectedProbePath)
+    {
+        Assert.True(File.Exists(reparseProbePath), $"Reparse probe does not exist: {reparseProbePath}");
+        var expectedHash = await ComputeSha256Async(expectedProbePath, CancellationToken.None);
+        var launcher = new WindowsSidecarProcessLauncher();
+
+        var error = await Assert.ThrowsAsync<SidecarProtocolException>(() => launcher.LaunchAsync(
+            reparseProbePath,
+            expectedHash,
+            "reparse-point-session",
+            1,
+            new byte[32],
+            4096,
+            CancellationToken.None));
+
+        Assert.Contains("reparse point", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]

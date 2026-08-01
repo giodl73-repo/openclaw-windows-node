@@ -480,6 +480,48 @@ public sealed class WindowsSidecarCapabilityAdapterTests
     }
 
     [Fact]
+    public async Task VerifiedLauncher_RejectsReparsePointInArtifactPath()
+    {
+        var probePath = Environment.GetEnvironmentVariable("OPENCLAW_RUST_SIDECAR_PROBE");
+        if (!OperatingSystem.IsWindows() || string.IsNullOrWhiteSpace(probePath))
+            return;
+
+        var temporaryDirectory = Directory.CreateTempSubdirectory("openclaw-sidecar-path-");
+        var linkedDirectory = Path.Combine(temporaryDirectory.FullName, "probe-link");
+        try
+        {
+            try
+            {
+                Directory.CreateSymbolicLink(linkedDirectory, Path.GetDirectoryName(probePath)!);
+            }
+            catch (Exception symlinkError) when (symlinkError is UnauthorizedAccessException or IOException)
+            {
+                // Symlink creation can be disabled by local Windows policy.
+                return;
+            }
+
+            var linkedProbe = Path.Combine(linkedDirectory, Path.GetFileName(probePath));
+            var expectedHash = await ComputeSha256Async(probePath, CancellationToken.None);
+            var launcher = new WindowsSidecarProcessLauncher();
+
+            var error = await Assert.ThrowsAsync<SidecarProtocolException>(() => launcher.LaunchAsync(
+                linkedProbe,
+                expectedHash,
+                "reparse-point-session",
+                1,
+                new byte[32],
+                4096,
+                CancellationToken.None));
+
+            Assert.Contains("reparse point", error.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            temporaryDirectory.Delete(recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task Supervisor_ReturnsStableFailureWhenResultEnvelopeExceedsDepthLimit()
     {
         var nested = new string('[', 126) + "0" + new string(']', 126);

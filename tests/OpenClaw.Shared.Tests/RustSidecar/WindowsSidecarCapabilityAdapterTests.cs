@@ -1,3 +1,5 @@
+using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -357,6 +359,64 @@ public sealed class WindowsSidecarCapabilityAdapterTests
         var resultFrame = await supervisor.ReadOutboundAsync(CancellationToken.None);
         var result = SidecarJson.Parse(runtime.Open(resultFrame!));
         Assert.True(result.GetProperty("result").GetProperty("payload").GetProperty("ready").GetBoolean());
+    }
+
+    [Fact]
+    public async Task Supervisor_ExchangesFramesWithRealRustChildWhenProbeIsConfigured()
+    {
+        var probePath = Environment.GetEnvironmentVariable("OPENCLAW_RUST_SIDECAR_PROBE");
+        if (string.IsNullOrWhiteSpace(probePath))
+            return;
+        Assert.True(File.Exists(probePath), $"Rust sidecar probe does not exist: {probePath}");
+
+        using var fixture = ReadFixture("node-sidecar-handshake-v1.json");
+        var root = fixture.RootElement;
+        var session = root.GetProperty("session");
+        var sessionId = session.GetProperty("id").GetString()!;
+        var generation = session.GetProperty("generation").GetUInt64();
+        var keyBase64 = session.GetProperty("keyBase64").GetString()!;
+        var key = Convert.FromBase64String(keyBase64);
+        var adapter = new WindowsSidecarCapabilityAdapter("node-1", new TestLogger());
+        adapter.RegisterCapability(new TestCapability(
+            "native.status",
+            "product.status",
+            (_, _) => Task.FromResult(new NodeInvokeResponse
+            {
+                Ok = true,
+                Payload = new { ready = true }
+            })));
+        using var supervisor = new WindowsSidecarSupervisor(
+            sessionId,
+            generation,
+            key,
+            4096,
+            ParseOffer(root.GetProperty("supervisorOffer")),
+            adapter,
+            manifestGeneration: 3);
+        using var process = StartRustProbe(probePath, sessionId, generation, keyBase64);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+
+        await WriteTransportFrameAsync(process.StandardInput.BaseStream, supervisor.Start(), timeout.Token);
+        var acceptance = await ReadTransportFrameAsync(process.StandardOutput.BaseStream, timeout.Token);
+        await WriteTransportFrameAsync(
+            process.StandardInput.BaseStream,
+            supervisor.CompleteHandshake(acceptance),
+            timeout.Token);
+        await supervisor.ReceiveAsync(
+            await ReadTransportFrameAsync(process.StandardOutput.BaseStream, timeout.Token),
+            timeout.Token);
+
+        await RelayRuntimeRequestAsync(process, supervisor, timeout.Token);
+        await RelayRuntimeRequestAsync(process, supervisor, timeout.Token);
+        process.StandardInput.Close();
+        await process.WaitForExitAsync(timeout.Token);
+        var diagnostics = await process.StandardError.ReadToEndAsync(timeout.Token);
+
+        Assert.Equal(0, process.ExitCode);
+        Assert.Contains("windows sidecar process probe passed", diagnostics, StringComparison.Ordinal);
+        Assert.True(supervisor.IsAuthenticated);
+        Assert.True(supervisor.IsConfigured);
+        Assert.False(supervisor.IsRetired);
     }
 
     [Fact]
@@ -1832,6 +1892,65 @@ public sealed class WindowsSidecarCapabilityAdapterTests
             runtime.Dispose();
             throw;
         }
+    }
+
+    private static Process StartRustProbe(
+        string path,
+        string sessionId,
+        ulong generation,
+        string keyBase64)
+    {
+        var startInfo = new ProcessStartInfo(path)
+        {
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        startInfo.Environment["OPENCLAW_SIDECAR_SESSION_ID"] = sessionId;
+        startInfo.Environment["OPENCLAW_SIDECAR_GENERATION"] = generation.ToString(
+            System.Globalization.CultureInfo.InvariantCulture);
+        startInfo.Environment["OPENCLAW_SIDECAR_KEY_BASE64"] = keyBase64;
+        return Process.Start(startInfo) ?? throw new InvalidOperationException(
+            "Failed to start the Rust sidecar process probe.");
+    }
+
+    private static async Task RelayRuntimeRequestAsync(
+        Process process,
+        WindowsSidecarSupervisor supervisor,
+        CancellationToken cancellationToken)
+    {
+        var request = await ReadTransportFrameAsync(process.StandardOutput.BaseStream, cancellationToken);
+        await supervisor.ReceiveAsync(request, cancellationToken);
+        var response = await supervisor.ReadOutboundAsync(cancellationToken);
+        await WriteTransportFrameAsync(process.StandardInput.BaseStream, response, cancellationToken);
+    }
+
+    private static async Task<byte[]> ReadTransportFrameAsync(
+        Stream stream,
+        CancellationToken cancellationToken)
+    {
+        var prefix = new byte[sizeof(uint)];
+        await stream.ReadExactlyAsync(prefix, cancellationToken);
+        var length = BinaryPrimitives.ReadUInt32BigEndian(prefix);
+        if (length is 0 or > 4096)
+            throw new InvalidDataException($"Rust sidecar transport frame length {length} is invalid.");
+        var frame = new byte[length];
+        await stream.ReadExactlyAsync(frame, cancellationToken);
+        return frame;
+    }
+
+    private static async Task WriteTransportFrameAsync(
+        Stream stream,
+        byte[] frame,
+        CancellationToken cancellationToken)
+    {
+        var prefix = new byte[sizeof(uint)];
+        BinaryPrimitives.WriteUInt32BigEndian(prefix, checked((uint)frame.Length));
+        await stream.WriteAsync(prefix, cancellationToken);
+        await stream.WriteAsync(frame, cancellationToken);
+        await stream.FlushAsync(cancellationToken);
     }
 
     private static JsonElement ParseCanonical(JsonElement canonical) =>

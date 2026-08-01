@@ -1,5 +1,5 @@
 using System.Buffers.Binary;
-using System.Diagnostics;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -67,7 +67,8 @@ public sealed class WindowsSidecarCapabilityAdapterTests
             4096);
         var handshake = new SidecarSupervisorHandshake(
             channel,
-            ParseOffer(root.GetProperty("supervisorOffer")));
+            ParseOffer(root.GetProperty("supervisorOffer")),
+            RuntimeArtifactIdentity(root));
 
         Assert.Equal(root.GetProperty("offerFrameBase64").GetString(), Convert.ToBase64String(handshake.Start()));
         handshake.Accept(Convert.FromBase64String(root.GetProperty("acceptFrameBase64").GetString()!));
@@ -75,6 +76,29 @@ public sealed class WindowsSidecarCapabilityAdapterTests
         Assert.True(handshake.IsAuthenticated);
         Assert.Equal(2048u, channel.MaxFrameBytes);
         Assert.Equal(3ul, handshake.Selection!.FeatureBits);
+    }
+
+    [Fact]
+    public void Handshake_RejectsRuntimeThatDoesNotMatchVerifiedArtifact()
+    {
+        using var fixture = ReadFixture("node-sidecar-handshake-v1.json");
+        var root = fixture.RootElement;
+        var session = root.GetProperty("session");
+        using var channel = new AuthenticatedSidecarChannel(
+            SidecarPeerRole.Supervisor,
+            session.GetProperty("id").GetString()!,
+            session.GetProperty("generation").GetUInt64(),
+            Convert.FromBase64String(session.GetProperty("keyBase64").GetString()!),
+            4096);
+        var handshake = new SidecarSupervisorHandshake(
+            channel,
+            ParseOffer(root.GetProperty("supervisorOffer")),
+            "sha256:another-artifact");
+        _ = handshake.Start();
+
+        Assert.Throws<SidecarProtocolException>(() => handshake.Accept(
+            Convert.FromBase64String(root.GetProperty("acceptFrameBase64").GetString()!)));
+        Assert.True(channel.IsRetired);
     }
 
     [Fact]
@@ -91,7 +115,10 @@ public sealed class WindowsSidecarCapabilityAdapterTests
             4096);
         var offer = ParseOffer(root.GetProperty("supervisorOffer")) with { ProtocolMajor = 2 };
 
-        Assert.Throws<SidecarProtocolException>(() => new SidecarSupervisorHandshake(channel, offer));
+        Assert.Throws<SidecarProtocolException>(() => new SidecarSupervisorHandshake(
+            channel,
+            offer,
+            RuntimeArtifactIdentity(root)));
         Assert.True(channel.IsRetired);
     }
 
@@ -109,7 +136,10 @@ public sealed class WindowsSidecarCapabilityAdapterTests
             4096);
 
         Assert.Throws<SidecarProtocolException>(() =>
-            new SidecarSupervisorHandshake(channel, ParseOffer(root.GetProperty("supervisorOffer"))));
+            new SidecarSupervisorHandshake(
+                channel,
+                ParseOffer(root.GetProperty("supervisorOffer")),
+                RuntimeArtifactIdentity(root)));
         Assert.True(channel.IsRetired);
     }
 
@@ -139,7 +169,8 @@ public sealed class WindowsSidecarCapabilityAdapterTests
                 4096);
             var handshake = new SidecarSupervisorHandshake(
                 supervisorChannel,
-                ParseOffer(root.GetProperty("supervisorOffer")));
+                ParseOffer(root.GetProperty("supervisorOffer")),
+                RuntimeArtifactIdentity(root));
             _ = handshake.Start();
             var acceptance = new JsonObject
             {
@@ -305,6 +336,7 @@ public sealed class WindowsSidecarCapabilityAdapterTests
             key,
             4096,
             ParseOffer(root.GetProperty("supervisorOffer")),
+            RuntimeArtifactIdentity(root),
             adapter,
             manifestGeneration: 3);
         using var runtime = new AuthenticatedSidecarChannel(
@@ -362,7 +394,7 @@ public sealed class WindowsSidecarCapabilityAdapterTests
     }
 
     [Fact]
-    public async Task Supervisor_ExchangesFramesWithRealRustChildWhenProbeIsConfigured()
+    public async Task VerifiedLauncher_ExchangesFramesWithRealRustChildWhenProbeIsConfigured()
     {
         var probePath = Environment.GetEnvironmentVariable("OPENCLAW_RUST_SIDECAR_PROBE");
         if (string.IsNullOrWhiteSpace(probePath))
@@ -374,8 +406,17 @@ public sealed class WindowsSidecarCapabilityAdapterTests
         var session = root.GetProperty("session");
         var sessionId = session.GetProperty("id").GetString()!;
         var generation = session.GetProperty("generation").GetUInt64();
-        var keyBase64 = session.GetProperty("keyBase64").GetString()!;
-        var key = Convert.FromBase64String(keyBase64);
+        var key = Convert.FromBase64String(session.GetProperty("keyBase64").GetString()!);
+        var expectedHash = await ComputeSha256Async(probePath, CancellationToken.None);
+        var launcher = new WindowsSidecarProcessLauncher();
+        using var process = await launcher.LaunchAsync(
+            probePath,
+            expectedHash,
+            sessionId,
+            generation,
+            key,
+            4096,
+            CancellationToken.None);
         var adapter = new WindowsSidecarCapabilityAdapter("node-1", new TestLogger());
         adapter.RegisterCapability(new TestCapability(
             "native.status",
@@ -391,32 +432,51 @@ public sealed class WindowsSidecarCapabilityAdapterTests
             key,
             4096,
             ParseOffer(root.GetProperty("supervisorOffer")),
+            process.ArtifactIdentity,
             adapter,
             manifestGeneration: 3);
-        using var process = StartRustProbe(probePath, sessionId, generation, keyBase64);
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
 
-        await WriteTransportFrameAsync(process.StandardInput.BaseStream, supervisor.Start(), timeout.Token);
-        var acceptance = await ReadTransportFrameAsync(process.StandardOutput.BaseStream, timeout.Token);
+        Assert.Empty(process.StartInfo.ArgumentList);
+        Assert.Empty(process.StartInfo.Arguments);
+        Assert.False(process.StartInfo.Environment.ContainsKey("OPENCLAW_SIDECAR_KEY_BASE64"));
+        await WriteTransportFrameAsync(process.StandardInput, supervisor.Start(), timeout.Token);
+        var acceptance = await ReadTransportFrameAsync(process.StandardOutput, timeout.Token);
         await WriteTransportFrameAsync(
-            process.StandardInput.BaseStream,
+            process.StandardInput,
             supervisor.CompleteHandshake(acceptance),
             timeout.Token);
         await supervisor.ReceiveAsync(
-            await ReadTransportFrameAsync(process.StandardOutput.BaseStream, timeout.Token),
+            await ReadTransportFrameAsync(process.StandardOutput, timeout.Token),
             timeout.Token);
 
         await RelayRuntimeRequestAsync(process, supervisor, timeout.Token);
         await RelayRuntimeRequestAsync(process, supervisor, timeout.Token);
         process.StandardInput.Close();
         await process.WaitForExitAsync(timeout.Token);
-        var diagnostics = await process.StandardError.ReadToEndAsync(timeout.Token);
 
         Assert.Equal(0, process.ExitCode);
-        Assert.Contains("windows sidecar process probe passed", diagnostics, StringComparison.Ordinal);
         Assert.True(supervisor.IsAuthenticated);
         Assert.True(supervisor.IsConfigured);
         Assert.False(supervisor.IsRetired);
+    }
+
+    [Fact]
+    public async Task VerifiedLauncher_RejectsArtifactHashMismatchBeforeLaunch()
+    {
+        var probePath = Environment.GetEnvironmentVariable("OPENCLAW_RUST_SIDECAR_PROBE");
+        if (string.IsNullOrWhiteSpace(probePath))
+            return;
+        var launcher = new WindowsSidecarProcessLauncher();
+
+        await Assert.ThrowsAsync<SidecarProtocolException>(() => launcher.LaunchAsync(
+            probePath,
+            new string('0', 64),
+            "hash-mismatch-session",
+            1,
+            new byte[32],
+            4096,
+            CancellationToken.None));
     }
 
     [Fact]
@@ -1136,6 +1196,7 @@ public sealed class WindowsSidecarCapabilityAdapterTests
             key,
             4096,
             ParseOffer(root.GetProperty("supervisorOffer")),
+            RuntimeArtifactIdentity(root),
             adapter,
             manifestGeneration: 3);
         using var runtime = new AuthenticatedSidecarChannel(
@@ -1195,6 +1256,7 @@ public sealed class WindowsSidecarCapabilityAdapterTests
             key,
             4096,
             ParseOffer(root.GetProperty("supervisorOffer")),
+            RuntimeArtifactIdentity(root),
             adapter,
             manifestGeneration: 3);
         using var runtime = new AuthenticatedSidecarChannel(
@@ -1242,6 +1304,7 @@ public sealed class WindowsSidecarCapabilityAdapterTests
             key,
             4096,
             ParseOffer(root.GetProperty("supervisorOffer")),
+            RuntimeArtifactIdentity(root),
             adapter,
             manifestGeneration: 3);
         using var runtime = new AuthenticatedSidecarChannel(
@@ -1846,6 +1909,7 @@ public sealed class WindowsSidecarCapabilityAdapterTests
             key,
             4096,
             ParseOffer(root.GetProperty("supervisorOffer")),
+            RuntimeArtifactIdentity(root),
             adapter,
             manifestGeneration: 3);
         var runtime = new AuthenticatedSidecarChannel(
@@ -1894,37 +1958,15 @@ public sealed class WindowsSidecarCapabilityAdapterTests
         }
     }
 
-    private static Process StartRustProbe(
-        string path,
-        string sessionId,
-        ulong generation,
-        string keyBase64)
-    {
-        var startInfo = new ProcessStartInfo(path)
-        {
-            RedirectStandardInput = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        };
-        startInfo.Environment["OPENCLAW_SIDECAR_SESSION_ID"] = sessionId;
-        startInfo.Environment["OPENCLAW_SIDECAR_GENERATION"] = generation.ToString(
-            System.Globalization.CultureInfo.InvariantCulture);
-        startInfo.Environment["OPENCLAW_SIDECAR_KEY_BASE64"] = keyBase64;
-        return Process.Start(startInfo) ?? throw new InvalidOperationException(
-            "Failed to start the Rust sidecar process probe.");
-    }
-
     private static async Task RelayRuntimeRequestAsync(
-        Process process,
+        WindowsSidecarProcess process,
         WindowsSidecarSupervisor supervisor,
         CancellationToken cancellationToken)
     {
-        var request = await ReadTransportFrameAsync(process.StandardOutput.BaseStream, cancellationToken);
+        var request = await ReadTransportFrameAsync(process.StandardOutput, cancellationToken);
         await supervisor.ReceiveAsync(request, cancellationToken);
         var response = await supervisor.ReadOutboundAsync(cancellationToken);
-        await WriteTransportFrameAsync(process.StandardInput.BaseStream, response, cancellationToken);
+        await WriteTransportFrameAsync(process.StandardInput, response, cancellationToken);
     }
 
     private static async Task<byte[]> ReadTransportFrameAsync(
@@ -1961,6 +2003,19 @@ public sealed class WindowsSidecarCapabilityAdapterTests
 
     private static JsonDocument ReadFixture(string name) => JsonDocument.Parse(
         File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "RustSidecar", "Fixtures", name)));
+
+    private static string RuntimeArtifactIdentity(JsonElement root) =>
+        root.GetProperty("runtimeOffer").GetProperty("peer")
+            .GetProperty("artifactIdentity").GetString()!;
+
+    private static async Task<string> ComputeSha256Async(
+        string path,
+        CancellationToken cancellationToken)
+    {
+        await using var stream = File.OpenRead(path);
+        var hash = await SHA256.HashDataAsync(stream, cancellationToken);
+        return Convert.ToHexString(hash).ToLowerInvariant();
+    }
 
     private static SidecarProtocolOffer ParseOffer(JsonElement offer)
     {

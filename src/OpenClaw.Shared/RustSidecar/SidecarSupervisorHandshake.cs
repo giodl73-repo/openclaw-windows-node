@@ -7,11 +7,13 @@ internal sealed class SidecarSupervisorHandshake
 {
     private readonly AuthenticatedSidecarChannel _channel;
     private readonly SidecarProtocolOffer _localOffer;
+    private readonly string _expectedRuntimeArtifactIdentity;
     private bool _started;
 
     internal SidecarSupervisorHandshake(
         AuthenticatedSidecarChannel channel,
-        SidecarProtocolOffer localOffer)
+        SidecarProtocolOffer localOffer,
+        string expectedRuntimeArtifactIdentity)
     {
         _channel = channel ?? throw new ArgumentNullException(nameof(channel));
         try
@@ -19,6 +21,9 @@ internal sealed class SidecarSupervisorHandshake
             if (channel.LocalRole != SidecarPeerRole.Supervisor)
                 throw new SidecarProtocolException("Sidecar supervisor handshake requires a supervisor channel.");
             _localOffer = ValidateOffer(localOffer, SidecarPeerRole.Supervisor);
+            if (string.IsNullOrWhiteSpace(expectedRuntimeArtifactIdentity))
+                throw new SidecarProtocolException("Expected runtime artifact identity is required.");
+            _expectedRuntimeArtifactIdentity = expectedRuntimeArtifactIdentity;
             if (_localOffer.ProtocolMajor != AuthenticatedSidecarChannel.ProtocolMajor ||
                 _localOffer.ProtocolMinor > AuthenticatedSidecarChannel.ProtocolMinor)
             {
@@ -72,6 +77,13 @@ internal sealed class SidecarSupervisorHandshake
                 throw new SidecarProtocolException("Runtime did not return a sidecar acceptance.");
             var remote = ParseOffer(SidecarJson.RequiredObject(message, "offer"));
             ValidateOffer(remote, SidecarPeerRole.Runtime);
+            if (!string.Equals(
+                    remote.Peer.ArtifactIdentity,
+                    _expectedRuntimeArtifactIdentity,
+                    StringComparison.Ordinal))
+            {
+                throw new SidecarProtocolException("Runtime sidecar artifact identity does not match the verified artifact.");
+            }
             var claimed = ParseSelection(SidecarJson.RequiredObject(message, "selection"));
             var negotiated = Negotiate(_localOffer, remote);
             if (claimed != negotiated)

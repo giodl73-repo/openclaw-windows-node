@@ -31,6 +31,7 @@ internal sealed class WindowsSidecarSupervisor : IDisposable
         ReadOnlySpan<byte> sessionKey,
         uint bootstrapFrameLimit,
         SidecarProtocolOffer localOffer,
+        string expectedRuntimeArtifactIdentity,
         WindowsSidecarCapabilityAdapter adapter,
         ulong manifestGeneration)
     {
@@ -40,7 +41,10 @@ internal sealed class WindowsSidecarSupervisor : IDisposable
             generation,
             sessionKey,
             bootstrapFrameLimit);
-        _handshake = new SidecarSupervisorHandshake(_channel, localOffer);
+        _handshake = new SidecarSupervisorHandshake(
+            _channel,
+            localOffer,
+            expectedRuntimeArtifactIdentity);
         _adapter = adapter;
         _manifestGeneration = manifestGeneration;
     }
